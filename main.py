@@ -14,6 +14,13 @@ Every endpoint requires an `X-API-Key` header matching ATTENDANCE_LOGGER_API_KEY
 (set in .env, or the environment). The ESP32 firmware and mycelia-comm's server
 proxy both send this key; nothing else should be able to reach this service.
 
+In production this process runs on localhost:8001 behind a reverse proxy that
+publishes it at https://app.jnanafarms.com/esp32_attendance_logger/api/. Every
+route below is registered BOTH at its bare path (/users, /attendance, ...) and
+under the /esp32_attendance_logger/api prefix, so it works whether the reverse
+proxy strips that prefix before forwarding or passes the path through as-is —
+no assumption about the proxy config is required.
+
 Run:
     pip install -r requirements.txt
     uvicorn main:app --host 0.0.0.0 --port 8001
@@ -26,7 +33,7 @@ from pathlib import Path
 
 import sqlite3
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -43,6 +50,8 @@ if not API_KEY:
         "and make sure the ESP32 firmware and mycelia-comm's ATTENDANCE_LOGGER_API_KEY use the same value."
     )
 
+PUBLIC_PREFIX = "/esp32_attendance_logger/api"
+
 
 def require_api_key(x_api_key: str | None = Header(default=None)):
     if not x_api_key or not secrets.compare_digest(x_api_key, API_KEY):
@@ -50,6 +59,7 @@ def require_api_key(x_api_key: str | None = Header(default=None)):
 
 
 app = FastAPI(title="Attendance Logger", dependencies=[Depends(require_api_key)])
+router = APIRouter()
 
 
 def db():
@@ -106,7 +116,7 @@ class AttendanceIn(BaseModel):
 # ---------------------------------------------------------------------------
 # Users
 # ---------------------------------------------------------------------------
-@app.post("/users")
+@router.post("/users")
 def upsert_user(u: UserIn):
     with db() as con:
         con.execute(
@@ -118,14 +128,14 @@ def upsert_user(u: UserIn):
     return {"ok": True, "id": u.id}
 
 
-@app.get("/users")
+@router.get("/users")
 def list_users():
     with db() as con:
         rows = con.execute("SELECT * FROM users ORDER BY id").fetchall()
     return {"users": [dict(r) for r in rows]}
 
 
-@app.delete("/users/{user_id}")
+@router.delete("/users/{user_id}")
 def delete_user(user_id: int):
     with db() as con:
         cur = con.execute("DELETE FROM users WHERE id=?", (user_id,))
@@ -137,7 +147,7 @@ def delete_user(user_id: int):
 # ---------------------------------------------------------------------------
 # Attendance
 # ---------------------------------------------------------------------------
-@app.post("/attendance")
+@router.post("/attendance")
 def push_attendance(a: AttendanceIn):
     with db() as con:
         con.execute(
@@ -157,7 +167,7 @@ def push_attendance(a: AttendanceIn):
     return {"ok": True}
 
 
-@app.get("/attendance")
+@router.get("/attendance")
 def query_attendance(frm: int | None = None, to: int | None = None):
     sql = "SELECT * FROM attendance"
     params = []
@@ -176,7 +186,7 @@ def query_attendance(frm: int | None = None, to: int | None = None):
 # ---------------------------------------------------------------------------
 # Photos
 # ---------------------------------------------------------------------------
-@app.post("/photos/{name}")
+@router.post("/photos/{name}")
 async def upload_photo(name: str, request: Request):
     body = await request.body()
     if len(body) == 0:
@@ -187,9 +197,16 @@ async def upload_photo(name: str, request: Request):
     return {"ok": True, "name": name}
 
 
-@app.get("/photos/{name}")
+@router.get("/photos/{name}")
 def get_photo(name: str):
     p = PHOTO_DIR / name
     if not p.exists():
         raise HTTPException(404, "photo not found")
     return FileResponse(p, media_type="image/jpeg")
+
+
+# Mounted twice on purpose (see module docstring): bare paths for local/dev use
+# and direct testing, plus the public prefix for whichever way the production
+# reverse proxy forwards requests.
+app.include_router(router)
+app.include_router(router, prefix=PUBLIC_PREFIX)
